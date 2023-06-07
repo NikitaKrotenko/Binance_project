@@ -5,6 +5,7 @@ import schedule
 import pytz
 from datetime import datetime, timedelta
 from dateutil.relativedelta import FR, relativedelta
+from time import sleep
 
 import pandas as pd
 import numpy as np
@@ -12,11 +13,11 @@ import numpy as np
 from sqlalchemy import create_engine
 import textwrap 
 import logging
-import requests
-import json
 import configparser
 from binance.client import Client
-requests.packages.urllib3.disable_warnings()
+from quarter_functions import get_quarter_time_left, get_quarter_symbol
+
+from send_telegram_message import send_telegram_message
 
 logging.basicConfig(filename='logs.log', level=logging.INFO,
                     format='%(asctime)s:%(levelname)s:%(message)s')
@@ -31,40 +32,6 @@ def run_sql_script(script):
     cursor.execute(script)
     connection.close()
     return cursor.fetchall()
-
-def get_time_left(t):
-    time = datetime.fromtimestamp(t)
-    delivery = time + relativedelta(month = ((time.month-1)//3+1)*3) + relativedelta(day= 31, weekday=FR(-1)) + relativedelta(hour=8, minute=0, second=0)
-    delivery = pytz.utc.localize(delivery)
-
-    if (delivery.timestamp() < t):
-        time = (time + timedelta(weeks=2))
-        delivery = time + relativedelta(month = ((time.month-1)//3+1)*3) + relativedelta(day= 31, weekday=FR(-1)) + relativedelta(hour=8, minute=0, second=0)
-
-    return delivery.timestamp() - t
-
-def send_telegram_message(message, chat_id, api_key, proxy_username = None, proxy_password = None, proxy_url = None):
-    responses = {}
-    proxies = None
-    if proxy_url is not None:
-        proxies = {
-            'https': f'http://{username}:{password}@{proxy_url}',
-            'http': f'http://{username}:{password}@{proxy_url}'
-        }
-    headers = {'Content-Type': 'application/json',
-                'Proxy-Authorization': 'Basic base64'}
-    data_dict = {'chat_id': chat_id,
-                    'text': message,
-                    'parse_mode': 'HTML',
-                    'disable_notification': True}
-    data = json.dumps(data_dict)
-    url = f'https://api.telegram.org/bot{api_key}/sendMessage'
-    response = requests.post(url,
-                             data=data,
-                             headers=headers,
-                             proxies=proxies,
-                             verify=False)
-    return response
 
 def connect_ssh_tunnel(ssh_address, ssh_username, ssh_password):
     try:
@@ -111,8 +78,15 @@ def load_historical_data():
     while(shape_before != shape_after):
         for i in range (20):
             shape_before = df_perpetual.shape[0]
-            df_perpetual = df_perpetual.append (pd.DataFrame (client.futures_continous_klines(pair='BTCUSDT', contractType='PERPETUAL',
-                                                            interval='1m', endTime = endTime_iterator, limit = 1500)).iloc[::-1])
+            df_perpetual = df_perpetual.append(pd.DataFrame(
+                client.futures_continous_klines(
+                    pair='BTCUSDT', 
+                    contractType='PERPETUAL',
+                    interval='1m', 
+                    endTime = endTime_iterator,
+                    limit = 1500
+                )
+            ).iloc[::-1])
             shape_after = df_perpetual.shape[0]
             endTime_iterator = df_perpetual.iloc[-1,0] - 30000
         print(shape_after, end = '>')
@@ -122,8 +96,15 @@ def load_historical_data():
     while(shape_before != shape_after):
         for i in range (20):
             shape_before = df_cq.shape[0]
-            df_cq        = df_cq.append ( pd.DataFrame (client.futures_continous_klines(pair='BTCUSDT', contractType='CURRENT_QUARTER',
-                                                        interval='1m', endTime = endTime_iterator, limit = 1500)).iloc[::-1])
+            df_cq = df_cq.append(pd.DataFrame(
+                client.futures_continous_klines(
+                    pair='BTCUSDT', 
+                    contractType='CURRENT_QUARTER',
+                    interval='1m', 
+                    endTime = endTime_iterator,
+                    limit = 1500
+                )
+            ).iloc[::-1])
             shape_after = df_cq.shape[0]
             endTime_iterator = df_cq.iloc[-1,0] - 30000
         print(shape_after, end = '>')
@@ -133,7 +114,13 @@ def load_historical_data():
     shape_before, shape_after = 1, 0
     while(shape_before != shape_after):
         shape_before = futures_history.shape[0]
-        futures_history = futures_history.append(pd.DataFrame.from_dict(client.futures_funding_rate(symbol = 'btcusdt', startTime = startTime, limit = 1000)).iloc[:,1:])
+        futures_history = futures_history.append(
+            pd.DataFrame.from_dict(client.futures_funding_rate(
+                symbol = 'btcusdt', 
+                startTime = startTime, 
+                limit = 1000
+            )).iloc[:,1:]
+        )
         shape_after = futures_history.shape[0]
         startTime = futures_history.iloc[-1,0] + 30000
         print(shape_after, end = '>')
@@ -154,12 +141,13 @@ def load_historical_data():
     futures_history['timestamp'] = futures_history.apply(lambda row: row['timestamp'] - 60 * (480-row.name%480-1), axis= 1)
 
     df_perpetual = df_perpetual.merge(futures_history, how='left', on='timestamp')
-    df_cq['time_left'] = df_cq['timestamp'].apply(lambda x: get_time_left(x))
+    df_cq['time_left'] = df_cq['timestamp'].apply(lambda x: get_quarter_time_left(x))
 
     try:
         df_cq.to_sql('BTC_current_quarter', engine, if_exists = 'append', index = False)
         df_perpetual.to_sql('BTC_perpetual', engine, if_exists = 'append', index = False)
     except BaseException as e:
+        send_telegram_message('ERROR: {}'.format(e), config['telegram']['heorhii'], config['telegram']['token_error'])
         send_telegram_message('ERROR: {}'.format(e), config['telegram']['nikita'], config['telegram']['token_error'])
         logging.info('ERROR: {}'.format(e))
 
@@ -181,12 +169,28 @@ def backup_from_last_record():
 
     startTime_iterator = startTime_perp
     while startTime_iterator/1000 < datetime.today().timestamp():
-        df_perpetual = df_perpetual.append (pd.DataFrame (client.futures_continous_klines(pair='BTCUSDT', contractType='PERPETUAL', interval='1m', startTime = startTime_iterator, limit = 1500)))
+        df_perpetual = df_perpetual.append(
+            pd.DataFrame(client.futures_continous_klines(
+                pair='BTCUSDT', 
+                contractType='PERPETUAL', 
+                interval='1m', 
+                startTime = startTime_iterator, 
+                limit = 1500)
+            )
+        )
         startTime_iterator = df_perpetual.iloc[-1,0] + 30000
 
     startTime_iterator = startTime_cq
     while startTime_iterator/1000 < datetime.today().timestamp():
-        df_cq        = df_cq.append (pd.DataFrame (client.futures_continous_klines(pair='BTCUSDT', contractType='CURRENT_QUARTER', interval='1m', startTime = startTime_iterator, limit = 1500)))
+        df_cq = df_cq.append(
+            pd.DataFrame(client.futures_continous_klines(
+                pair='BTCUSDT', 
+                contractType='CURRENT_QUARTER', 
+                interval='1m', 
+                startTime = startTime_iterator, 
+                limit = 1500)
+            )
+        )
         startTime_iterator = df_perpetual.iloc[-1,0] + 30000
 
 
@@ -203,7 +207,12 @@ def backup_from_last_record():
     df_cq['timestamp']//=1000
 
     try:
-        futures_history = pd.DataFrame.from_dict(client.futures_funding_rate(symbol = 'btcusdt', startTime = startTime_perp, limit = 1000)).iloc[:,1:]
+        futures_history = pd.DataFrame.from_dict(
+            client.futures_funding_rate(
+                symbol = 'btcusdt', 
+                startTime = startTime_perp, 
+                limit = 1000)
+        ).iloc[:,1:]
         futures_history['fundingTime']//=1000
         futures_history = pd.DataFrame(np.repeat(futures_history.values, 480, axis=0), columns= ['timestamp','funding_rate'])
         futures_history['timestamp'] = futures_history.apply(lambda row: row['timestamp'] - 60 * (480-row.name%480-1), axis= 1)
@@ -215,18 +224,20 @@ def backup_from_last_record():
     finally:
         pass
 
-    df_cq['time_left'] = df_cq['timestamp'].apply(lambda x: get_time_left(x))
+    df_cq['time_left'] = df_cq['timestamp'].apply(lambda x: get_quarter_time_left(x))
 
     try:
         df_cq.to_sql('BTC_current_quarter', engine, if_exists = 'append', index = False)
     except BaseException as e:
         send_telegram_message('ERROR: {}'.format(e), config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('ERROR: {}'.format(e), config['telegram']['heorhii'], config['telegram']['token_error'])
         logging.info('ERROR: {}'.format(e))
 
     try:
         df_perpetual.to_sql('BTC_perpetual', engine, if_exists = 'append', index = False)
     except BaseException as e:
         send_telegram_message('ERROR: {}'.format(e), config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('ERROR: {}'.format(e), config['telegram']['heorhii'], config['telegram']['token_error'])
         logging.info('ERROR: {}'.format(e))
     
     logging.info('data transfered successfully {}/{} records added'.format(df_perpetual.shape[0], df_cq.shape[0]))
@@ -243,13 +254,15 @@ def stream():
     last_cq.drop(columns = [6,7,9,10,11], inplace = True)
     last_cq.columns = ['timestamp', 'open', 'max', 'min', 'close', 'volume', 'number_of_trades']
     last_cq['timestamp']//=1000
-    last_cq['time_left'] = last_cq['timestamp'].apply(lambda x: get_time_left(x))
+    last_cq['time_left'] = last_cq['timestamp'].apply(lambda x: get_quarter_time_left(x))
 
     try:
        last_perp.to_sql('BTC_perpetual', engine, if_exists = 'append', index = False)
        last_cq.to_sql('BTC_current_quarter', engine, if_exists = 'append', index = False)
     except BaseException as e:
         send_telegram_message('ERROR: {}'.format(e), config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('ERROR: {}'.format(e), config['telegram']['heorhii'], config['telegram']['token_error'])
+
         logging.info('ERROR: {}'.format(e))
 
 def daily_notification():
@@ -331,21 +344,37 @@ def weekly_notification():
     send_telegram_message(message, config['telegram']['nikita'], config['telegram']['token_daily'])
     send_telegram_message(message, config['telegram']['heorhii'], config['telegram']['token_daily'])
 
-
 def get_bid_ask_data():
+    def get_quarter_symbol():
+        time = datetime.now()
+        delivery = time + relativedelta(month = ((time.month-1)//3+1)*3) + relativedelta(day= 31, weekday=FR(-1)) + relativedelta(hour=8, minute=0, second=0)
+        delivery = pytz.utc.localize(delivery)
+
+        if (delivery.timestamp() < time.timestamp()):
+            time = (time + timedelta(weeks=2))
+            delivery = time + relativedelta(month = ((time.month-1)//3+1)*3) + relativedelta(day= 31, weekday=FR(-1)) + relativedelta(hour=8, minute=0, second=0)
+
+        quarter_symbol = 'BTCUSDT_{}{}{}'.format(delivery.year%100, str(delivery.month).zfill(2), delivery.day)
+        return quarter_symbol
+
     BTC_perp_bid_ask = pd.DataFrame.from_dict([client.futures_orderbook_ticker(symbol = 'BTCUSDT')]).iloc[:,1:-1]
     BTC_perp_bid_ask['timestamp'] = int(datetime.now().timestamp()//60*60)
     BTC_perp_bid_ask['funding_rate'] = client.futures_mark_price(symbol = 'BTCUSDT')['lastFundingRate']
 
-    BTC_cq_bid_ask = pd.DataFrame.from_dict([client.futures_orderbook_ticker(symbol = 'BTCUSDT_220930')]).iloc[:,1:-1]
+    BTC_cq_bid_ask = pd.DataFrame.from_dict([
+        client.futures_orderbook_ticker(
+            symbol = get_quarter_symbol(datetime.now().timestamp())
+        )
+    ]).iloc[:,1:-1]
     BTC_cq_bid_ask['timestamp'] = int(datetime.now().timestamp()//60*60)
-    BTC_cq_bid_ask['time_left'] = get_time_left(BTC_cq_bid_ask['timestamp'][0])
+    BTC_cq_bid_ask['time_left'] = get_quarter_time_left(BTC_cq_bid_ask['timestamp'][0])
 
     try:
        BTC_perp_bid_ask.to_sql('BTC_perp_bid_ask', engine, if_exists = 'append', index = False)
        BTC_cq_bid_ask.to_sql('BTC_cq_bid_ask', engine, if_exists = 'append', index = False)
     except BaseException as e:
         send_telegram_message('ERROR: {}'.format(e), config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('ERROR: {}'.format(e), config['telegram']['heorhii'], config['telegram']['token_error'])
         logging.info('ERROR: {}'.format(e))
 
 def run_backup_and_stream():
@@ -361,9 +390,23 @@ def run_backup_and_stream():
         pass
     finally:
         send_telegram_message('Script stopped!', config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('Script stopped!', config['telegram']['heorhii'], config['telegram']['token_error'])
+
         logging.info("stopping scheduler")
         schedule.clear()
 
-connect_ssh_tunnel(config['ssh']['address'], config['ssh']['username'], config['ssh']['password'])
-create_sql_engine()
-run_backup_and_stream()
+def main():
+    try:
+        send_telegram_message('Script started!', config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('Script started!', config['telegram']['heorhii'], config['telegram']['token_error'])
+        connect_ssh_tunnel(config['ssh']['address'], config['ssh']['username'], config['ssh']['password'])
+        create_sql_engine()
+        run_backup_and_stream()
+    except:
+        send_telegram_message('Script stopped!, restarting in 300 seconds', config['telegram']['nikita'], config['telegram']['token_error'])
+        send_telegram_message('Script stopped!, restarting in 300 seconds', config['telegram']['heorhii'], config['telegram']['token_error'])
+        sleep(300)
+        main()
+
+if __name__ == '__main__':
+    main()
